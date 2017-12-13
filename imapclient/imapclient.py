@@ -6,7 +6,7 @@ from __future__ import unicode_literals
 
 import imaplib
 import itertools
-import select
+import selectors2 as selectors
 import socket
 import sys
 import re
@@ -14,6 +14,9 @@ from collections import namedtuple
 from datetime import datetime, date
 from operator import itemgetter
 from logging import LoggerAdapter, getLogger
+from .idlepool import Idlepool
+
+from threading import Event
 
 from six import moves, iteritems, text_type, integer_types, PY3, binary_type, iterbytes
 
@@ -75,6 +78,8 @@ ANSWERED = br'\Answered'
 FLAGGED = br'\Flagged'
 DRAFT = br'\Draft'
 RECENT = br'\Recent'         # This flag is read-only
+
+pool = Idlepool()
 
 
 class Namespace(tuple):
@@ -664,7 +669,19 @@ class IMAPClient(object):
         if resp is not None:
             raise exceptions.IMAPClientError('Unexpected IDLE response: %s' % resp)
 
-    def idle_check(self, timeout=None):
+    def idle_select(self, async=True):
+        sock = self._sock
+
+        # make the socket non-blocking so the timeout can be
+        # implemented for this call
+        if async:
+            sock.settimeout(None)
+            sock.setblocking(0)
+        else:
+            sock.setblocking(1)
+            self._set_read_timeout()
+
+    def idle_check(self, clientKey, timeout=None, interrupt=None):
         """Check for any IDLE responses sent by the server.
 
         This method should only be called if the server is in IDLE
@@ -688,27 +705,34 @@ class IMAPClient(object):
         # implemented for this call
         sock.settimeout(None)
         sock.setblocking(0)
+
+        if not interrupt:
+            interrupt = Event()
+
+        pool.registerClient(clientKey, self, interrupt)
+        resps = []
+        if interrupt.wait(timeout):
+            resps.append(('BYE', 'Event set'))
+
         try:
-            resps = []
-            rs, _, _ = select.select([sock], [], [], timeout)
-            if rs:
-                while True:
-                    try:
-                        line = self._imap._get_line()
-                    except (socket.timeout, socket.error):
+            while True:
+                try:
+                    line = self._imap._get_line()
+                except (socket.timeout, socket.error):
+                    break
+                except IMAPClient.AbortError:
+                    # An imaplib.IMAP4.abort with "EOF" is raised
+                    # under Python 3
+                    err = sys.exc_info()[1]
+                    if 'EOF' in err.args[0]:
                         break
-                    except IMAPClient.AbortError:
-                        # An imaplib.IMAP4.abort with "EOF" is raised
-                        # under Python 3
-                        err = sys.exc_info()[1]
-                        if 'EOF' in err.args[0]:
-                            break
-                        else:
-                            raise
                     else:
-                        resps.append(_parse_untagged_response(line))
+                        raise
+                else:
+                    resps.append(_parse_untagged_response(line))
             return resps
         finally:
+            pool.unregisterClient(clientKey)
             sock.setblocking(1)
             self._set_read_timeout()
 
