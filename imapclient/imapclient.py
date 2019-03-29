@@ -669,12 +669,12 @@ class IMAPClient(object):
         if resp is not None:
             raise exceptions.IMAPClientError('Unexpected IDLE response: %s' % resp)
 
-    def idle_select(self, async=True):
+    def idle_select(self, non_blocking=True):
         sock = self._sock
 
         # make the socket non-blocking so the timeout can be
         # implemented for this call
-        if async:
+        if non_blocking:
             sock.settimeout(None)
             sock.setblocking(0)
         else:
